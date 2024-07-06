@@ -1,5 +1,7 @@
 #pragma once
 #include <sstream>
+#include <codecvt>
+#include <locale>
 
 #include <pe_sieve_types.h>
 #include <paramkit.h>
@@ -16,6 +18,7 @@ using namespace pesieve;
 #define PARAM_IAT "iat"
 #define PARAM_HOOKS "hooks"
 #define PARAM_SHELLCODE "shellc"
+#define PARAM_OBFUSCATED "obfusc"
 #define PARAM_THREADS "threads"
 #define PARAM_DATA "data"
 #define PARAM_MODULES_IGNORE "mignore"
@@ -23,6 +26,7 @@ using namespace pesieve;
 #define PARAM_PNAME "pname"
 #define PARAM_PID "pid"
 #define PARAM_LOOP "loop"
+#define PARAM_ETW "etw"
 #define PARAM_REFLECTION "refl"
 #define PARAM_CACHE "cache"
 #define PARAM_DOTNET_POLICY "dnet"
@@ -39,6 +43,7 @@ using namespace pesieve;
 #define PARAM_KILL "kill"
 #define PARAM_UNIQUE_DIR "uniqd"
 #define PARAM_DIR "dir"
+#define PARAM_PATTERN "pattern"
 #define PARAM_MINIDUMP "minidmp"
 #define PARAM_LOG "log"
 #define PARAM_JSON "json"
@@ -74,26 +79,12 @@ void print_version(const std::string &version , WORD info_color = HILIGHTED_COLO
     std::cout << std::endl;
 }
 
-bool alloc_strparam(PARAM_STRING& strparam, ULONG len)
+std::wstring to_wstring(const std::string& stringToConvert)
 {
-    if (strparam.buffer != nullptr) { // already allocated
-        return false;
-    }
-    strparam.buffer = (char*)calloc(len + 1, sizeof(char));
-    if (strparam.buffer) {
-        strparam.length = len;
-        return true;
-    }
-    return false;
+    std::wstring wideString =
+        std::wstring_convert<std::codecvt_utf8<wchar_t>>().from_bytes(stringToConvert);
+    return wideString;
 }
-
-void free_strparam(PARAM_STRING& strparam)
-{
-    free(strparam.buffer);
-    strparam.buffer = nullptr;
-    strparam.length = 0;
-}
-
 
 class HHParams : public Params
 {
@@ -151,7 +142,13 @@ public:
 
         this->addParam(new BoolParam(PARAM_LOOP, false));
         this->setInfo(PARAM_LOOP, "Enable continuous scanning.");
-
+        BoolParam* etwParam = new BoolParam(PARAM_ETW, false);
+        this->addParam(etwParam);
+        this->setInfo(PARAM_ETW, "Use ETW (requires Administrator privilege).");
+#ifndef USE_ETW
+        etwParam->setActive(false);
+        this->setInfo(PARAM_ETW, "Use ETW (disabled).");
+#endif //USE_ETW
         EnumParam *enumParam = new EnumParam(PARAM_IMP_REC, "imprec_mode", false);
         if (enumParam) {
             this->addParam(enumParam);
@@ -202,8 +199,26 @@ public:
         this->setInfo(PARAM_MINIDUMP, "Create a minidump of the full suspicious process.");
 
         //PARAM_SHELLCODE
-        this->addParam(new BoolParam(PARAM_SHELLCODE, false));
-        this->setInfo(PARAM_SHELLCODE, "Detect shellcode implants (by patterns). ");
+        enumParam = new EnumParam(PARAM_SHELLCODE, "shellc_mode", false);
+        if (enumParam) {
+            this->addParam(enumParam);
+            this->setInfo(PARAM_SHELLCODE, "Detect shellcode implants (by patterns or statistics). ");
+            for (size_t i = 0; i < SHELLC_COUNT; i++) {
+                t_shellc_mode mode = (t_shellc_mode)(i);
+                enumParam->addEnumValue(mode, shellc_mode_mode_to_id(mode), translate_shellc_mode(mode));
+            }
+        }
+
+        //PARAM_OBFUSCATED
+        enumParam = new EnumParam(PARAM_OBFUSCATED, "obfusc_mode", false);
+        if (enumParam) {
+            this->addParam(enumParam);
+            this->setInfo(PARAM_OBFUSCATED, "Detect encrypted content, and possible obfuscated shellcodes.");
+            for (size_t i = 0; i < OBFUSC_COUNT; i++) {
+                t_obfusc_mode mode = (t_obfusc_mode)(i);
+                enumParam->addEnumValue(mode, obfusc_mode_mode_to_id(mode), translate_obfusc_mode(mode));
+            }
+        }
 
         //PARAM_THREADS
         this->addParam(new BoolParam(PARAM_THREADS, false));
@@ -227,6 +242,9 @@ public:
                 enumParam->addEnumValue(mode, translate_iat_scan_mode(mode));
             }
         }
+
+        this->addParam(new StringParam(PARAM_PATTERN, false));
+        this->setInfo(PARAM_PATTERN, "Set additional shellcode patterns (file in the SIG format).");
 
         //PARAM_DOTNET_POLICY
         enumParam = new EnumParam(PARAM_DOTNET_POLICY, "dotnet_policy", false);
@@ -286,9 +304,12 @@ public:
         this->addParamToGroup(PARAM_DATA, str_group);
         this->addParamToGroup(PARAM_IAT, str_group);
         this->addParamToGroup(PARAM_SHELLCODE, str_group);
+        this->addParamToGroup(PARAM_OBFUSCATED, str_group);  
         this->addParamToGroup(PARAM_THREADS, str_group);
         this->addParamToGroup(PARAM_HOOKS, str_group);
-
+        this->addParamToGroup(PARAM_PATTERN, str_group);
+        this->addParamToGroup(PARAM_ETW, str_group);
+ 
         str_group = "5. dump options";
         this->addGroup(new ParamGroup(str_group));
         this->addParamToGroup(PARAM_MINIDUMP, str_group);
@@ -345,38 +366,79 @@ public:
         std::cout << "URL: " << HH_URL << std::endl;
     }
 
-    void fillStruct(t_hh_params &ps)
+    void fillStruct(t_hh_params& ps)
     {
         fillPEsieveStruct(ps.pesieve_args);
         bool hooks = false;
         copyVal<BoolParam>(PARAM_HOOKS, hooks);
         ps.pesieve_args.no_hooks = hooks ? false : true;
 
-        copyVal<StringParam>(PARAM_DIR, ps.out_dir);
         copyVal<BoolParam>(PARAM_UNIQUE_DIR, ps.unique_dir);
         copyVal<BoolParam>(PARAM_SUSPEND, ps.suspend_suspicious);
         copyVal<BoolParam>(PARAM_KILL, ps.kill_suspicious);
-
+#ifdef USE_ETW
+        copyVal<BoolParam>(PARAM_ETW, ps.etw_scan);
+#endif // USE_ETW
         copyVal<BoolParam>(PARAM_LOOP, ps.loop_scanning);
         copyVal<BoolParam>(PARAM_LOG, ps.log);
         copyVal<BoolParam>(PARAM_QUIET, ps.quiet);
         copyVal<IntParam>(PARAM_PTIMES, ps.ptimes);
         copyVal<BoolParam>(PARAM_JSON, ps.json_output);
+        copyVal<StringParam>(PARAM_DIR, ps.out_dir);
 
         StringListParam* myParam = dynamic_cast<StringListParam*>(this->getParam(PARAM_PNAME));
         if (myParam && myParam->isSet()) {
-            myParam->stripToElements(ps.names_list);
+            std::set<std::string> names_list;
+            myParam->stripToElements(names_list);
+            for (auto itr = names_list.begin(); itr != names_list.end(); itr++) {
+                ps.names_list.insert(to_wstring(*itr));
+            }
         }
 
         myParam = dynamic_cast<StringListParam*>(this->getParam(PARAM_PROCESSES_IGNORE));
         if (myParam && myParam->isSet()) {
-            myParam->stripToElements(ps.ignored_names_list);
+            std::set<std::string> ignored_names_list;
+            myParam->stripToElements(ignored_names_list);
+            for (auto itr = ignored_names_list.begin(); itr != ignored_names_list.end(); itr++) {
+                ps.ignored_names_list.insert(to_wstring(*itr));
+            }
         }
-
-        IntListParam *myIntParam = dynamic_cast<IntListParam*>(this->getParam(PARAM_PID));
+        IntListParam* myIntParam = dynamic_cast<IntListParam*>(this->getParam(PARAM_PID));
         if (myIntParam && myIntParam->isSet()) {
             myIntParam->stripToIntElements(ps.pids_list);
         }
+    }
+
+    void freeStruct(t_hh_params& ps)
+    {
+        free_strparam(ps.pesieve_args.modules_ignored);
+        free_strparam(ps.pesieve_args.pattern_file);
+    }
+
+protected:
+
+    // Fill PE-sieve params
+
+    bool alloc_strparam(PARAM_STRING& strparam, size_t len)
+    {
+        if (strparam.buffer != nullptr) { // already allocated
+            return false;
+        }
+        strparam.buffer = (char*)calloc(len + 1, sizeof(char));
+        if (strparam.buffer) {
+            strparam.length = len;
+            return true;
+        }
+        return false;
+    }
+
+    void free_strparam(pesieve::PARAM_STRING& strparam)
+    {
+        if (strparam.buffer) {
+            free(strparam.buffer);
+        }
+        strparam.buffer = nullptr;
+        strparam.length = 0;
     }
 
     bool fillStringParam(const std::string& paramId, PARAM_STRING& strparam)
@@ -398,26 +460,29 @@ public:
         return is_copied;
     }
 
-    protected:
-        void fillPEsieveStruct(t_params &ps)
-        {
-            copyVal<EnumParam>(PARAM_IMP_REC, ps.imprec_mode);
-            copyVal<EnumParam>(PARAM_OUT_FILTER, ps.out_filter);
+    void fillPEsieveStruct(t_params& ps)
+    {
+        copyVal<EnumParam>(PARAM_IMP_REC, ps.imprec_mode);
+        copyVal<EnumParam>(PARAM_OUT_FILTER, ps.out_filter);
 
-            fillStringParam(PARAM_MODULES_IGNORE, ps.modules_ignored);
+        fillStringParam(PARAM_MODULES_IGNORE, ps.modules_ignored);
 
-            copyVal<BoolParam>(PARAM_QUIET, ps.quiet);
-            copyVal<EnumParam>(PARAM_JSON_LVL, ps.json_lvl);
+        copyVal<BoolParam>(PARAM_QUIET, ps.quiet);
+        copyVal<EnumParam>(PARAM_JSON_LVL, ps.json_lvl);
 
-            copyVal<BoolParam>(PARAM_MINIDUMP, ps.minidump);
-            copyVal<BoolParam>(PARAM_SHELLCODE, ps.shellcode);
-            copyVal<BoolParam>(PARAM_THREADS, ps.threads);
-            copyVal<BoolParam>(PARAM_REFLECTION, ps.make_reflection);
-            copyVal<BoolParam>(PARAM_CACHE, ps.use_cache);
+        copyVal<BoolParam>(PARAM_MINIDUMP, ps.minidump);
+        copyVal<EnumParam>(PARAM_SHELLCODE, ps.shellcode);
+        copyVal<EnumParam>(PARAM_OBFUSCATED, ps.obfuscated);
+        copyVal<BoolParam>(PARAM_THREADS, ps.threads);
+        copyVal<BoolParam>(PARAM_REFLECTION, ps.make_reflection);
+        copyVal<BoolParam>(PARAM_CACHE, ps.use_cache);
 
-            copyVal<EnumParam>(PARAM_IAT, ps.iat);
-            copyVal<EnumParam>(PARAM_DOTNET_POLICY, ps.dotnet_policy);
-            copyVal<EnumParam>(PARAM_DATA, ps.data);
-            copyVal<EnumParam>(PARAM_DUMP_MODE, ps.dump_mode);
-        }
+        copyVal<EnumParam>(PARAM_IAT, ps.iat);
+        copyVal<EnumParam>(PARAM_DOTNET_POLICY, ps.dotnet_policy);
+        copyVal<EnumParam>(PARAM_DATA, ps.data);
+        copyVal<EnumParam>(PARAM_DUMP_MODE, ps.dump_mode);
+
+        fillStringParam(PARAM_PATTERN, ps.pattern_file);
+    }
+
 };

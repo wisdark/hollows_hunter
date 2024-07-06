@@ -4,6 +4,11 @@ project (hollows_hunter)
 option(HH_BUILD_TESTING "Enable testing for HollowsHunter" ON)
 option (PECONV_LIB_INSTALL OFF)
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MT")
+option( USE_ETW "Use ETW" ON )
+if(USE_ETW)
+    add_compile_definitions(USE_ETW)
+	#FYI Krabs need to be built as a static lib which is not the default from the submodule 
+endif()
 
 # static linking for GNU compilers
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -21,6 +26,7 @@ endif()
 # modules:
 set ( M_PESIEVE "pe-sieve" )
 set ( M_PARAMKIT "paramkit" )
+
 
 # modules paths:
 set (PESIEVE_DIR "${PROJECT_SOURCE_DIR}/${M_PESIEVE}" CACHE PATH "PE-sieve main path")
@@ -54,7 +60,22 @@ set (hdrs
 	util/process_privilege.h
 	util/time_util.h
 	util/strings_util.h
+	util/process_util.h
 )
+
+if(USE_ETW)
+	set (srcs
+		${srcs}
+		etw_listener.cpp
+	)
+
+	set (hdrs
+		${hdrs}
+		etw_listener.h
+		krabsetw/krabs/krabs.hpp
+	)
+endif()
+
 set (rsrc
 	resources.h
 	hh_res.rc
@@ -76,7 +97,6 @@ set ( PESIEVE_LIB $<TARGET_FILE:pe-sieve> CACHE PATH "PE-sieve library path" )
 add_subdirectory ( ${PARAMKIT_DIR} )
 set ( PARAMKIT_LIB $<TARGET_FILE:paramkit> CACHE PATH "ParamKit library path" )
 
-
 cmake_policy(SET CMP0015 NEW)
 LINK_DIRECTORIES ( ${PESIEVE_LIB} )
 add_executable ( ${PROJECT_NAME} ${hdrs} ${srcs} ${rsrc} main.cpp )
@@ -84,7 +104,8 @@ target_link_libraries ( ${PROJECT_NAME} ${M_PESIEVE} ${M_PARAMKIT} "psapi.lib" "
 
 # dependencies
 add_dependencies( ${PROJECT_NAME} ${M_PESIEVE} ${M_PARAMKIT} )
-
+target_compile_definitions(${PROJECT_NAME} PUBLIC -DUNICODE)
+target_compile_definitions(${M_PARAMKIT} PUBLIC -DUNICODE)
 #install
 INSTALL( TARGETS ${PROJECT_NAME} DESTINATION ${CMAKE_INSTALL_PREFIX} COMPONENT ${PROJECT_NAME} )
 
@@ -115,4 +136,8 @@ if(HH_BUILD_TESTING)
 	# 5) test scan threads with caching
 	add_test (TestThreadsScan ${CMAKE_INSTALL_PREFIX}/hollows_hunter -json -dir scan_out -cache -threads)
 	set_tests_properties(TestThreadsScan PROPERTIES PASS_REGULAR_EXPRESSION "\"suspicious_count\" : ")
+
+	# 6) test scan code patterns with caching
+	add_test (TestCodeScanNoDump ${CMAKE_INSTALL_PREFIX}/hollows_hunter -json -dir scan_out -cache -shellc P -ofilter 2)
+	set_tests_properties(TestCodeScanNoDump PROPERTIES PASS_REGULAR_EXPRESSION "\"suspicious_count\" : ")
 endif()

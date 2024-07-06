@@ -4,96 +4,22 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
-
+#include <codecvt>
+#include <locale>
 #include <time.h>
 #include <tlhelp32.h>
 
 #include "util/suspend.h"
 #include "util/time_util.h"
 #include "term_util.h"
+#include "util/process_util.h"
 
 #include <paramkit.h>
+#include <mutex>
 
 #define PID_FIELD_SIZE 4
 
 using namespace pesieve;
-
-namespace process_util {
-
-    bool is_wow_64(HANDLE process)
-    {
-        FARPROC procPtr = GetProcAddress(GetModuleHandleA("kernel32"), "IsWow64Process");
-        if (!procPtr) {
-            //this system does not have a function IsWow64Process
-            return false;
-        }
-        BOOL(WINAPI * is_process_wow64)(IN HANDLE, OUT PBOOL)
-            = (BOOL(WINAPI*)(IN HANDLE, OUT PBOOL))procPtr;
-
-        BOOL isCurrWow64 = FALSE;
-        if (!is_process_wow64(process, &isCurrWow64)) {
-            return false;
-        }
-        return isCurrWow64 ? true : false;
-    }
-
-    bool get_process_info(DWORD processID, bool &isWow64, char* szProcessName, DWORD processNameSize)
-    {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, processID);
-        if (!hProcess) {
-            return false;
-        }
-
-        bool is_ok = true;
-        if (szProcessName && processNameSize > 0) {
-            DWORD cbNeeded = 0;
-            HMODULE hMod = nullptr;
-            memset(szProcessName, 0, processNameSize);
-            if (EnumProcessModules(hProcess, &hMod, sizeof(hMod), &cbNeeded)) {
-                GetModuleBaseNameA(hProcess, hMod, szProcessName, processNameSize);
-            } else { is_ok = false; }
-        }
-        isWow64 = is_wow_64(hProcess);
-        CloseHandle(hProcess);
-        return is_ok;
-    }
-
-    size_t suspend_suspicious(std::vector<DWORD> &suspicious_pids)
-    {
-        size_t done = 0;
-        std::vector<DWORD>::iterator itr;
-        for (itr = suspicious_pids.begin(); itr != suspicious_pids.end(); ++itr) {
-            DWORD pid = *itr;
-            if (!suspend_process(pid)) {
-                std::cerr << "Could not suspend the process. PID = " << pid << std::endl;
-            }
-        }
-        return done;
-    }
-
-    size_t kill_suspicious(std::vector<DWORD> &suspicious_pids)
-    {
-        size_t killed = 0;
-        std::vector<DWORD>::iterator itr;
-        for (itr = suspicious_pids.begin(); itr != suspicious_pids.end(); ++itr) {
-            DWORD pid = *itr;
-            HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-            if (!hProcess) {
-                continue;
-            }
-            if (TerminateProcess(hProcess, 0)) {
-                killed++;
-            }
-            else {
-                std::cerr << "Could not terminate the process. PID = " << pid << std::endl;
-            }
-            CloseHandle(hProcess);
-        }
-        return killed;
-    }
-
-}; // namespace process_util
-
 
 namespace files_util {
 
@@ -154,12 +80,12 @@ namespace files_util {
 
 namespace util {
 
-    bool is_searched_name(const char* processName, std::set<std::string> &names_list)
+    bool is_searched_name(const WCHAR* processName, std::set<std::wstring> &names_list)
     {
-        std::set<std::string>::iterator itr;
+        std::set<std::wstring>::iterator itr;
         for (itr = names_list.begin(); itr != names_list.end(); ++itr) {
-            const char* searchedName = itr->c_str();
-            if (_stricmp(processName, searchedName) == 0) {
+            const WCHAR* searchedName = itr->c_str();
+            if (_wcsicmp(processName, searchedName) == 0) {
                 return true;
             }
         }
@@ -178,7 +104,7 @@ namespace util {
     template <typename TYPE_T>
     std::string list_to_str(std::set<TYPE_T> &list)
     {
-        std::stringstream stream;
+        std::wstringstream stream;
 
         std::set<TYPE_T>::iterator itr;
         for (itr = list.begin(); itr != list.end(); ) {
@@ -188,7 +114,7 @@ namespace util {
                 stream << ", ";
             }
         }
-        return stream.str();
+        return std::wstring_convert<std::codecvt_utf8<wchar_t>>().to_bytes(stream.str());
     }
 
 }; //namespace util
@@ -229,11 +155,13 @@ void HHScanner::printScanRoundStats(size_t found, size_t ignored_count)
 {
     if (!found && hh_args.names_list.size() > 0) {
         if (!hh_args.quiet) {
+            const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
             std::cout << "[WARNING] No process from the list: {" << util::list_to_str(hh_args.names_list) << "} was found!" << std::endl;
         }
     }
     if (!found && hh_args.pids_list.size() > 0) {
         if (!hh_args.quiet) {
+            const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
             std::cout << "[WARNING] No process from the list: {" << util::list_to_str(hh_args.pids_list) << "} was found!" << std::endl;
         }
     }
@@ -241,6 +169,7 @@ void HHScanner::printScanRoundStats(size_t found, size_t ignored_count)
         if (!hh_args.quiet) {
             std::string info1 = (ignored_count > 1) ? "processes" : "process";
             std::string info2 = (ignored_count > 1) ? "were" : "was";
+            const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
             std::cout << "[INFO] " << std::dec << ignored_count << " " << info1 << " from the list : {" << util::list_to_str(hh_args.ignored_names_list) << "} " << info2 << " ignored!" << std::endl;
         }
     }
@@ -255,6 +184,7 @@ size_t HHScanner::scanProcesses(HHScanReport &my_report)
     HANDLE hProcessSnapShot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hProcessSnapShot == INVALID_HANDLE_VALUE) {
         const DWORD err = GetLastError();
+        const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
         std::cerr << "[-] Could not create modules snapshot. Error: " << std::dec << err << std::endl;
         return 0;
     }
@@ -265,6 +195,7 @@ size_t HHScanner::scanProcesses(HHScanReport &my_report)
     //check all modules in the process, including the main module:
     if (!Process32First(hProcessSnapShot, &pe32)) {
         CloseHandle(hProcessSnapShot);
+        const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
         std::cerr << "[-] Could not enumerate processes. Error: " << GetLastError() << std::endl;
         return 0;
     }
@@ -289,6 +220,7 @@ void HHScanner::printSingleReport(pesieve::t_report& report)
     if (hh_args.quiet) return;
 
     if (report.errors == pesieve::ERROR_SCAN_FAILURE) {
+        const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
         WORD old_color = set_color(MAKE_COLOR(SILVER, DARK_RED));
         if (report.errors == pesieve::ERROR_SCAN_FAILURE) {
             std::cout << "[!] Could not access: " << std::dec << report.pid;
@@ -299,6 +231,7 @@ void HHScanner::printSingleReport(pesieve::t_report& report)
     }
 #ifndef _WIN64
     if (report.is_64bit) {
+        const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
         WORD old_color = set_color(MAKE_COLOR(SILVER, DARK_MAGENTA));
         std::cout << "[!] Partial scan: " << std::dec << report.pid << " : " << (report.is_64bit ? 64 : 32) << "b";
         set_color(old_color);
@@ -313,6 +246,7 @@ void HHScanner::printSingleReport(pesieve::t_report& report)
         if (report.is_managed) {
             color = MAKE_COLOR(color, DARK_BLUE);
         }
+        const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
         WORD old_color = set_color(color);
         std::cout << ">> Detected: " << std::dec << report.pid;
         if (report.is_managed) {
@@ -323,16 +257,16 @@ void HHScanner::printSingleReport(pesieve::t_report& report)
     }
 }
 
-t_single_scan_status HHScanner::scanNextProcess(DWORD pid, char* exe_file, HHScanReport &my_report)
+t_single_scan_status HHScanner::scanNextProcess(DWORD pid, WCHAR* exe_file, HHScanReport &my_report)
 {
     bool found = false;
 
-    bool is_process_wow64 = false;
-    process_util::get_process_info(pid, is_process_wow64, nullptr, 0);
+    const bool is_process_wow64 = process_util::is_wow_64_by_pid(pid);
 
     const bool check_time = (hh_args.ptimes != TIME_UNDEFINED) ? true : false;
 #ifdef _DEBUG
     if (check_time) {
+        const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
         std::cout << "Init Time: " << std::hex << this->initTime << std::endl;
     }
 #endif
@@ -362,8 +296,9 @@ t_single_scan_status HHScanner::scanNextProcess(DWORD pid, char* exe_file, HHSca
         }
     }
     if (!hh_args.quiet) {
+        const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
         std::cout << ">> Scanning PID: " << std::setw(PID_FIELD_SIZE) << std::dec << pid;
-        std::cout << " : " << exe_file;
+        std::wcout << " : " << exe_file;
 
         if (is_process_wow64) {
             std::cout << " : 32b";
@@ -400,13 +335,29 @@ HHScanReport* HHScanner::scan()
     return my_report;
 }
 
-void HHScanner::summarizeScan(HHScanReport *hh_report)
+bool HHScanner::writeToLog(HHScanReport* hh_report)
+{
+    if (!hh_args.log) {
+        return false;
+    }
+
+    const bool suspiciousOnly = false;
+
+    std::string summary_str;
+    summary_str = hh_report->toString(suspiciousOnly);
+
+    static std::mutex logMutx;
+    const std::lock_guard<std::mutex> lock(logMutx);
+    return files_util::write_to_file("hollows_hunter.log", summary_str, true);
+}
+
+void HHScanner::summarizeScan(HHScanReport *hh_report, bool suspiciousOnly)
 {
     if (!hh_report) return;
     std::string summary_str;
 
     if (!this->hh_args.json_output) {
-        summary_str = hh_report->toString();
+        summary_str = hh_report->toString(suspiciousOnly);
         std::cout << summary_str;
     }
     else {
@@ -418,11 +369,15 @@ void HHScanner::summarizeScan(HHScanReport *hh_report)
         //file the same report into the directory with dumps:
         if (hh_report->suspicious.size()) {
             std::string report_path = files_util::join_path(this->outDir, "summary.json");
-            files_util::write_to_file(report_path, hh_report->toJSON(this->hh_args), false);
+
+            static std::mutex summaryMutx;
+            const std::lock_guard<std::mutex> lock(summaryMutx);
+            //TODO: fix JSON formatting for the appended reports
+            files_util::write_to_file(report_path, hh_report->toJSON(this->hh_args), true);
         }
     }
     if (hh_args.log) {
-        files_util::write_to_file("hollows_hunter.log", summary_str, true);
+        writeToLog(hh_report);
     }
     if (hh_args.suspend_suspicious) {
         process_util::suspend_suspicious(hh_report->suspicious);

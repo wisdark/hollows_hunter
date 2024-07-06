@@ -28,14 +28,15 @@ public:
     HHScanner(t_hh_params &_args);
 
     HHScanReport* scan();
-    void summarizeScan(HHScanReport *hh_report);
+    bool writeToLog(HHScanReport* hh_report);
+    void summarizeScan(HHScanReport *hh_report, bool suspiciousOnly = true);
 
 protected:
     void printScanRoundStats(size_t found, size_t ignored_count);
     size_t scanProcesses(HHScanReport &my_report);
     void printSingleReport(pesieve::t_report& report);
 
-    t_single_scan_status scanNextProcess(DWORD pid, char* image_buf, HHScanReport &report);
+    t_single_scan_status scanNextProcess(DWORD pid, WCHAR* image_buf, HHScanReport &report);
     void initOutDir(time_t scan_time, pesieve::t_params &pesieve_args);
 
     t_hh_params &hh_args;
@@ -46,3 +47,6 @@ protected:
     bool isScannerWow64;
 };
 
+
+// Global arguments
+extern t_hh_params g_hh_args;

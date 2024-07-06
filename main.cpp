@@ -1,3 +1,13 @@
+#define WIN32_LEAN_AND_MEAN
+
+#ifndef _WIN64
+#undef USE_ETW //ETW support works only for 64 bit
+#endif //_WIN64
+
+#if (_MSC_VER < 1900)
+#undef USE_ETW //ETW not supported
+#endif
+
 #include <stdio.h>
 
 #include <string>
@@ -20,19 +30,39 @@
 
 using namespace hhunter::util;
 
+// Global arguments
+t_hh_params g_hh_args;
+
+#ifdef USE_ETW
+#include "etw_listener.h"
+#endif
+
 void compatibility_alert()
 {
     print_in_color(WARNING_COLOR, "[!] Scanner mismatch! For a 64-bit OS, use the 64-bit version of the scanner!\n");
 }
 
-t_pesieve_res deploy_scan(t_hh_params &hh_args)
+t_pesieve_res deploy_scan()
 {
     t_pesieve_res scan_res = PESIEVE_NOT_DETECTED;
-    if (hh_args.pesieve_args.data >= pesieve::PE_DATA_SCAN_INACCESSIBLE && hh_args.pesieve_args.make_reflection == false) {
+    hhunter::util::set_debug_privilege();
+    if (g_hh_args.pesieve_args.data >= pesieve::PE_DATA_SCAN_INACCESSIBLE && g_hh_args.pesieve_args.make_reflection == false) {
         print_in_color(RED, "[WARNING] Scanning of inaccessible pages is enabled only in the reflection mode!\n");
     }
-    hhunter::util::set_debug_privilege();
-    HHScanner hhunter(hh_args);
+    if (g_hh_args.etw_scan)
+    {
+#ifdef USE_ETW
+        if (!ETWstart()) {
+            return PESIEVE_ERROR;
+        }
+#else
+        std::cerr << "ETW support is disabled\n";
+        return PESIEVE_ERROR;
+#endif
+    }
+    else
+    {
+        HHScanner hhunter(g_hh_args);
     do {
         HHScanReport *report = hhunter.scan();
         if (report) {
@@ -45,32 +75,26 @@ t_pesieve_res deploy_scan(t_hh_params &hh_args)
         if (!HHScanner::isScannerCompatibile()) {
             compatibility_alert();
         }
-    } while (hh_args.loop_scanning);
-
+        } while (g_hh_args.loop_scanning);
+    }
     return scan_res;
-}
-
-void free_params(t_params& args)
-{
-    free_strparam(args.modules_ignored);
 }
 
 int main(int argc, char *argv[])
 {
-    t_hh_params hh_args;
-    hh_args_init(hh_args);
+    g_hh_args.init();
 
     bool info_req = false;
     HHParams uParams(HH_VERSION_STR);
     if (!uParams.parse(argc, argv)) {
         return PESIEVE_INFO;
     }
-    uParams.fillStruct(hh_args);
+    uParams.fillStruct(g_hh_args);
 
     // if scanning of inaccessible pages was requested, auto-enable reflection mode:
-    if (hh_args.pesieve_args.data == pesieve::PE_DATA_SCAN_INACCESSIBLE || hh_args.pesieve_args.data == pesieve::PE_DATA_SCAN_INACCESSIBLE_ONLY) {
-        if (!hh_args.pesieve_args.make_reflection) {
-            hh_args.pesieve_args.make_reflection = true;
+    if (g_hh_args.pesieve_args.data == pesieve::PE_DATA_SCAN_INACCESSIBLE || g_hh_args.pesieve_args.data == pesieve::PE_DATA_SCAN_INACCESSIBLE_ONLY) {
+        if (!g_hh_args.pesieve_args.make_reflection) {
+            g_hh_args.pesieve_args.make_reflection = true;
             print_in_color(RED, "[WARNING] Scanning of inaccessible pages requested: auto-enabled reflection mode!\n");
         }
     }
@@ -81,7 +105,7 @@ int main(int argc, char *argv[])
         print_in_color(WHITE, "Default scan deployed.");
         std::cout << std::endl;
     }
-    const t_pesieve_res  res = deploy_scan(hh_args);
-    free_params(hh_args.pesieve_args);
+    const t_pesieve_res  res = deploy_scan();
+    uParams.freeStruct(g_hh_args);
     return res;
 }
