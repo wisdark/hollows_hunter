@@ -35,10 +35,12 @@ using namespace pesieve;
 //dump options:
 #define PARAM_IMP_REC "imp"
 #define PARAM_DUMP_MODE "dmode"
+#define PARAM_REBASE "rebase"
 
 //output options:
 #define PARAM_QUIET "quiet"
 #define PARAM_OUT_FILTER "ofilter"
+#define PARAM_RESULTS_FILTER "report"
 #define PARAM_SUSPEND "suspend"
 #define PARAM_KILL "kill"
 #define PARAM_UNIQUE_DIR "uniqd"
@@ -84,6 +86,32 @@ std::wstring to_wstring(const std::string& stringToConvert)
     std::wstring wideString =
         std::wstring_convert<std::codecvt_utf8<wchar_t>>().from_bytes(stringToConvert);
     return wideString;
+}
+
+std::string cache_mode_to_id(const t_cache_mode mode)
+{
+    switch (mode) {
+    case CACHE_DISABLED:
+        return "D";
+    case CACHE_AUTO:
+        return "A";
+    case CACHE_ENABLED:
+        return "E";
+    }
+    return "";
+}
+
+std::string translate_cache_mode(const t_cache_mode mode)
+{
+    switch (mode) {
+    case CACHE_DISABLED:
+        return "cache always disabled";
+    case CACHE_AUTO:
+        return "automatically enable cache in continuous scanning mode (default)";
+    case CACHE_ENABLED:
+        return "cache always enabled";
+    }
+    return "";
 }
 
 class HHParams : public Params
@@ -143,12 +171,14 @@ public:
         this->addParam(new BoolParam(PARAM_LOOP, false));
         this->setInfo(PARAM_LOOP, "Enable continuous scanning.");
         BoolParam* etwParam = new BoolParam(PARAM_ETW, false);
-        this->addParam(etwParam);
-        this->setInfo(PARAM_ETW, "Use ETW (requires Administrator privilege).");
+        if (etwParam) {
+            this->addParam(etwParam);
+            this->setInfo(PARAM_ETW, "Use ETW (requires Administrator privilege).");
 #ifndef USE_ETW
-        etwParam->setActive(false);
-        this->setInfo(PARAM_ETW, "Use ETW (disabled).");
+            etwParam->setActive(false);
+            this->setInfo(PARAM_ETW, "Use ETW (disabled).");
 #endif //USE_ETW
+        }
         EnumParam *enumParam = new EnumParam(PARAM_IMP_REC, "imprec_mode", false);
         if (enumParam) {
             this->addParam(enumParam);
@@ -166,6 +196,18 @@ public:
             for (size_t i = 0; i < OUT_FILTERS_COUNT; i++) {
                 t_output_filter mode = (t_output_filter)(i);
                 enumParam->addEnumValue(mode, translate_out_filter(mode));
+            }
+        }
+
+        enumParam = new EnumParam(PARAM_RESULTS_FILTER, "result_type", false);
+        if (enumParam) {
+            this->addParam(enumParam);
+            this->setInfo(PARAM_RESULTS_FILTER, "Define what type of results are reported.");
+            for (size_t i = SHOW_SUSPICIOUS; i <= SHOW_ALL; i++) {
+                t_results_filter mode = (t_results_filter)(i);
+                std::string info = translate_results_filter(mode);
+                if (info.empty()) continue;
+                enumParam->addEnumValue(mode, results_filter_to_id(i), info);
             }
         }
 
@@ -198,6 +240,10 @@ public:
         this->addParam(new BoolParam(PARAM_MINIDUMP, false));
         this->setInfo(PARAM_MINIDUMP, "Create a minidump of the full suspicious process.");
 
+        //PARAM_DUMP_MODE
+        this->addParam(new BoolParam(PARAM_REBASE, false));
+        this->setInfo(PARAM_REBASE, "Rebase the module to its original base (if known).");
+
         //PARAM_SHELLCODE
         enumParam = new EnumParam(PARAM_SHELLCODE, "shellc_mode", false);
         if (enumParam) {
@@ -229,8 +275,15 @@ public:
         this->setInfo(PARAM_REFLECTION, "Make a process reflection before scan.", "\t   This allows i.e. to force-read inaccessible pages.");
 
         //PARAM_CACHE
-        this->addParam(new BoolParam(PARAM_CACHE, false));
-        this->setInfo(PARAM_CACHE, "Use modules caching.", "\t   This can speed up the scan (on the cost of memory consumption).");
+        enumParam = new EnumParam(PARAM_CACHE, "cache_mode", false);
+        if (enumParam) {
+            this->addParam(enumParam);
+            this->setInfo(PARAM_CACHE, "Use modules caching. This can speed up the scan (on the cost of memory consumption).\n");
+            for (size_t i = 0; i < CACHE_MODES_COUNT; i++) {
+                t_cache_mode mode = (t_cache_mode)(i);
+                enumParam->addEnumValue(mode, cache_mode_to_id(mode), translate_cache_mode(mode));
+            }
+        }
 
         //PARAM_IAT
         enumParam = new EnumParam(PARAM_IAT, "iat_scan_mode", false);
@@ -289,6 +342,7 @@ public:
         this->addParamToGroup(PARAM_JSON, str_group);
         this->addParamToGroup(PARAM_JSON_LVL, str_group);
         this->addParamToGroup(PARAM_OUT_FILTER, str_group);
+        this->addParamToGroup(PARAM_RESULTS_FILTER, str_group);
         this->addParamToGroup(PARAM_LOG, str_group);
         this->addParamToGroup(PARAM_UNIQUE_DIR, str_group);
 
@@ -315,6 +369,7 @@ public:
         this->addParamToGroup(PARAM_MINIDUMP, str_group);
         this->addParamToGroup(PARAM_IMP_REC, str_group);
         this->addParamToGroup(PARAM_DUMP_MODE, str_group);
+        this->addParamToGroup(PARAM_REBASE, str_group);
 
         str_group = "3. scan exclusions";
         this->addGroup(new ParamGroup(str_group));
@@ -373,6 +428,7 @@ public:
         copyVal<BoolParam>(PARAM_HOOKS, hooks);
         ps.pesieve_args.no_hooks = hooks ? false : true;
 
+        copyVal<EnumParam>(PARAM_CACHE, ps.cache_mode);
         copyVal<BoolParam>(PARAM_UNIQUE_DIR, ps.unique_dir);
         copyVal<BoolParam>(PARAM_SUSPEND, ps.suspend_suspicious);
         copyVal<BoolParam>(PARAM_KILL, ps.kill_suspicious);
@@ -406,6 +462,17 @@ public:
         IntListParam* myIntParam = dynamic_cast<IntListParam*>(this->getParam(PARAM_PID));
         if (myIntParam && myIntParam->isSet()) {
             myIntParam->stripToIntElements(ps.pids_list);
+        }
+
+        ps.pesieve_args.use_cache = false;
+        if (ps.cache_mode == CACHE_ENABLED) {
+            ps.pesieve_args.use_cache = true;
+        }
+        else if (ps.cache_mode == CACHE_AUTO) {
+            if (ps.loop_scanning || ps.etw_scan) {
+                //continuous scanning: enable cache
+                ps.pesieve_args.use_cache = true;
+            }
         }
     }
 
@@ -464,9 +531,11 @@ protected:
     {
         copyVal<EnumParam>(PARAM_IMP_REC, ps.imprec_mode);
         copyVal<EnumParam>(PARAM_OUT_FILTER, ps.out_filter);
+        copyVal<EnumParam>(PARAM_RESULTS_FILTER, ps.results_filter);
 
         fillStringParam(PARAM_MODULES_IGNORE, ps.modules_ignored);
 
+        copyVal<BoolParam>(PARAM_REBASE, ps.rebase);
         copyVal<BoolParam>(PARAM_QUIET, ps.quiet);
         copyVal<EnumParam>(PARAM_JSON_LVL, ps.json_lvl);
 
@@ -475,7 +544,6 @@ protected:
         copyVal<EnumParam>(PARAM_OBFUSCATED, ps.obfuscated);
         copyVal<BoolParam>(PARAM_THREADS, ps.threads);
         copyVal<BoolParam>(PARAM_REFLECTION, ps.make_reflection);
-        copyVal<BoolParam>(PARAM_CACHE, ps.use_cache);
 
         copyVal<EnumParam>(PARAM_IAT, ps.iat);
         copyVal<EnumParam>(PARAM_DOTNET_POLICY, ps.dotnet_policy);

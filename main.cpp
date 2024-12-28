@@ -8,13 +8,8 @@
 #undef USE_ETW //ETW not supported
 #endif
 
-#include <stdio.h>
-
+#include <iostream>
 #include <string>
-#include <map>
-#include <vector>
-
-#include <sstream>
 
 #include "color_scheme.h"
 #include "hh_scanner.h"
@@ -52,7 +47,15 @@ t_pesieve_res deploy_scan()
     if (g_hh_args.etw_scan)
     {
 #ifdef USE_ETW
-        if (!ETWstart()) {
+        const char profileIni[] = "HH_ETWProfile.ini";
+        ETWProfile profile;
+        profile.initProfile(profileIni);
+        if (!profile.isEnabled()) {
+            std::cerr << "Cannot start ETW: the profile (\"" << profileIni << "\") is empty\n";
+            return PESIEVE_ERROR;
+        }
+        std::cout << "ETWProfile defined by:\"" << profileIni << "\"\n";
+        if (!ETWstart(profile)) {
             return PESIEVE_ERROR;
         }
 #else
@@ -63,18 +66,18 @@ t_pesieve_res deploy_scan()
     else
     {
         HHScanner hhunter(g_hh_args);
-    do {
-        HHScanReport *report = hhunter.scan();
-        if (report) {
-            hhunter.summarizeScan(report);
-            if (report->countSuspicious() > 0) {
-                scan_res = PESIEVE_DETECTED;
+        do {
+            HHScanReport *report = hhunter.scan();
+            if (report) {
+                hhunter.summarizeScan(report, g_hh_args.pesieve_args.results_filter);
+                if (report->countReports(pesieve::SHOW_SUSPICIOUS) > 0) {
+                    scan_res = PESIEVE_DETECTED;
+                }
+                delete report;
             }
-            delete report;
-        }
-        if (!HHScanner::isScannerCompatibile()) {
-            compatibility_alert();
-        }
+            if (!HHScanner::isScannerCompatibile()) {
+                compatibility_alert();
+            }
         } while (g_hh_args.loop_scanning);
     }
     return scan_res;

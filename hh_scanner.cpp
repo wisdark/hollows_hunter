@@ -17,7 +17,7 @@
 #include <paramkit.h>
 #include <mutex>
 
-#define PID_FIELD_SIZE 4
+#define PID_FIELD_SIZE 8
 
 using namespace pesieve;
 
@@ -34,7 +34,7 @@ namespace files_util {
         return stream.str();
     }
 
-    std::string make_dir_name(std::string baseDir, time_t timestamp)
+    std::string make_dir_name(const std::string &baseDir, time_t timestamp)
     {
         std::stringstream stream;
         if (baseDir.length() > 0) {
@@ -60,9 +60,9 @@ namespace files_util {
         return true;
     }
 
-    bool write_to_file(const std::string &report_path, const std::string &summary_str, const bool append)
+    bool write_to_file(const std::string &report_path, const std::wstring &summary_str, const bool append)
     {
-        std::ofstream final_report;
+        std::wofstream final_report;
         if (append) {
             final_report.open(report_path, std::ios_base::app);
         }
@@ -80,10 +80,9 @@ namespace files_util {
 
 namespace util {
 
-    bool is_searched_name(const WCHAR* processName, std::set<std::wstring> &names_list)
+    bool is_searched_name(const WCHAR* processName, const std::set<std::wstring> &names_list)
     {
-        std::set<std::wstring>::iterator itr;
-        for (itr = names_list.begin(); itr != names_list.end(); ++itr) {
+        for (auto itr = names_list.begin(); itr != names_list.end(); ++itr) {
             const WCHAR* searchedName = itr->c_str();
             if (_wcsicmp(processName, searchedName) == 0) {
                 return true;
@@ -92,7 +91,7 @@ namespace util {
         return false;
     }
 
-    bool is_searched_pid(long pid, std::set<long> &pids_list)
+    bool is_searched_pid(long pid, const std::set<long> &pids_list)
     {
         std::set<long>::iterator found = pids_list.find(pid);
         if (found != pids_list.end()) {
@@ -102,12 +101,11 @@ namespace util {
     }
 
     template <typename TYPE_T>
-    std::string list_to_str(std::set<TYPE_T> &list)
+    std::string list_to_str(const std::set<TYPE_T> &list)
     {
         std::wstringstream stream;
 
-        std::set<TYPE_T>::iterator itr;
-        for (itr = list.begin(); itr != list.end(); ) {
+        for (auto itr = list.begin(); itr != list.end(); ) {
             stream << *itr;
             ++itr;
             if (itr != list.end()) {
@@ -121,10 +119,12 @@ namespace util {
 
 //----
 
-HHScanner::HHScanner(t_hh_params &_args)
-    : hh_args(_args)
+HHScanner::HHScanner(t_hh_params& _args, time_t _initTime)
+    : hh_args(_args), initTime(_initTime)
 {
-    initTime = time(NULL);
+    if (!initTime) {
+        initTime = time(NULL);
+    }
     isScannerWow64 = process_util::is_wow_64(GetCurrentProcess());
 }
 
@@ -151,18 +151,26 @@ void HHScanner::initOutDir(time_t scan_time, pesieve::t_params &pesieve_args)
     }
 }
 
-void HHScanner::printScanRoundStats(size_t found, size_t ignored_count)
+void HHScanner::printScanRoundStats(size_t found, size_t ignored_count, size_t not_matched_count)
 {
+#ifdef _DEBUG
+    if (!found && not_matched_count) {
+        if (!hh_args.quiet) {
+            const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
+            std::cout << "[WARNING] Some processes were filtered out basing on the defined criteria: " << not_matched_count << " skipped" << std::endl;
+        }
+    }
+#endif
     if (!found && hh_args.names_list.size() > 0) {
         if (!hh_args.quiet) {
             const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
-            std::cout << "[WARNING] No process from the list: {" << util::list_to_str(hh_args.names_list) << "} was found!" << std::endl;
+            std::cout << "[WARNING] No process from the list: {" << util::list_to_str(hh_args.names_list) << "} was scanned!" << std::endl;
         }
     }
     if (!found && hh_args.pids_list.size() > 0) {
         if (!hh_args.quiet) {
             const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
-            std::cout << "[WARNING] No process from the list: {" << util::list_to_str(hh_args.pids_list) << "} was found!" << std::endl;
+            std::cout << "[WARNING] No process from the list: {" << util::list_to_str(hh_args.pids_list) << "} was scanned!" << std::endl;
         }
     }
     if (ignored_count > 0) {
@@ -180,6 +188,7 @@ size_t HHScanner::scanProcesses(HHScanReport &my_report)
     size_t count = 0;
     size_t scanned_count = 0;
     size_t ignored_count = 0;
+    size_t filtered_count = 0;
 
     HANDLE hProcessSnapShot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hProcessSnapShot == INVALID_HANDLE_VALUE) {
@@ -200,9 +209,11 @@ size_t HHScanner::scanProcesses(HHScanReport &my_report)
         return 0;
     }
     do {
+        if (pe32.th32ProcessID == 0) continue;
         // scan callback
         const t_single_scan_status stat = scanNextProcess(pe32.th32ProcessID, pe32.szExeFile, my_report);
         if (stat == SSCAN_IGNORED) ignored_count++;
+        if (stat == SSCAN_NOT_MATCH) filtered_count++;
         if (stat == SSCAN_SUCCESS) scanned_count++;
         count++;
 
@@ -211,7 +222,7 @@ size_t HHScanner::scanProcesses(HHScanReport &my_report)
     //close the handles
     CloseHandle(hProcessSnapShot);
 
-    printScanRoundStats(scanned_count, ignored_count);
+    printScanRoundStats(scanned_count, ignored_count, filtered_count);
     return count;
 }
 
@@ -257,19 +268,10 @@ void HHScanner::printSingleReport(pesieve::t_report& report)
     }
 }
 
-t_single_scan_status HHScanner::scanNextProcess(DWORD pid, WCHAR* exe_file, HHScanReport &my_report)
+t_single_scan_status HHScanner::shouldScanProcess(const hh_params &hh_args, const time_t hh_initTime, const DWORD pid, const WCHAR* exe_file)
 {
     bool found = false;
-
-    const bool is_process_wow64 = process_util::is_wow_64_by_pid(pid);
-
     const bool check_time = (hh_args.ptimes != TIME_UNDEFINED) ? true : false;
-#ifdef _DEBUG
-    if (check_time) {
-        const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
-        std::cout << "Init Time: " << std::hex << this->initTime << std::endl;
-    }
-#endif
     // filter by the time
     time_t time_diff = 0;
     if (check_time) { // if the parameter was set
@@ -277,8 +279,8 @@ t_single_scan_status HHScanner::scanNextProcess(DWORD pid, WCHAR* exe_file, HHSc
         if (process_time == INVALID_TIME) return SSCAN_ERROR0; //skip process if cannot retrieve the time
 
         // if HH was started after the process
-        if (this->initTime > process_time) {
-            time_diff = this->initTime - process_time;
+        if (hh_initTime > process_time) {
+            time_diff = hh_initTime - process_time;
             if (time_diff > hh_args.ptimes) return SSCAN_NOT_MATCH; // skip process created before the supplied time
         }
     }
@@ -295,16 +297,24 @@ t_single_scan_status HHScanner::scanNextProcess(DWORD pid, WCHAR* exe_file, HHSc
             return SSCAN_IGNORED;
         }
     }
+    return SSCAN_READY;
+}
+
+t_single_scan_status HHScanner::scanNextProcess(DWORD pid, WCHAR* exe_file, HHScanReport &my_report)
+{
+    const bool is_process_wow64 = process_util::is_wow_64_by_pid(pid);
+    t_single_scan_status res = HHScanner::shouldScanProcess(hh_args, this->initTime, pid, exe_file);
+    if (res != SSCAN_READY) {
+        return res;
+    }
     if (!hh_args.quiet) {
         const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
-        std::cout << ">> Scanning PID: " << std::setw(PID_FIELD_SIZE) << std::dec << pid;
-        std::wcout << " : " << exe_file;
+        std::wcout << ">> Scanning PID: "
+            << std::setw(PID_FIELD_SIZE) << std::dec << pid
+            << " : " << exe_file;
 
         if (is_process_wow64) {
             std::cout << " : 32b";
-        }
-        if (check_time) {
-            std::cout << " : " << time_diff << "s";
         }
         std::cout << std::endl;
     }
@@ -341,39 +351,39 @@ bool HHScanner::writeToLog(HHScanReport* hh_report)
         return false;
     }
 
-    const bool suspiciousOnly = false;
-
-    std::string summary_str;
-    summary_str = hh_report->toString(suspiciousOnly);
+    std::wstringstream stream;
+    hh_report->toString(stream, pesieve::SHOW_ALL);
 
     static std::mutex logMutx;
     const std::lock_guard<std::mutex> lock(logMutx);
-    return files_util::write_to_file("hollows_hunter.log", summary_str, true);
+    return files_util::write_to_file("hollows_hunter.log", stream.str(), true);
 }
 
-void HHScanner::summarizeScan(HHScanReport *hh_report, bool suspiciousOnly)
+void HHScanner::summarizeScan(HHScanReport *hh_report, const pesieve::t_results_filter rfilter)
 {
     if (!hh_report) return;
-    std::string summary_str;
+    std::wstringstream summary_str;
 
     if (!this->hh_args.json_output) {
-        summary_str = hh_report->toString(suspiciousOnly);
-        std::cout << summary_str;
+        hh_report->toString(summary_str, rfilter);
+        std::wcout << summary_str.rdbuf();
     }
     else {
-        summary_str = hh_report->toJSON(this->hh_args);
-        std::cout << summary_str;
+        hh_report->toJSON(summary_str, this->hh_args);
+        std::wcout << summary_str.rdbuf();
     }
 
     if (hh_args.pesieve_args.out_filter != OUT_NO_DIR) {
         //file the same report into the directory with dumps:
-        if (hh_report->suspicious.size()) {
+        if (hh_report->countReports(rfilter)) {
             std::string report_path = files_util::join_path(this->outDir, "summary.json");
 
             static std::mutex summaryMutx;
             const std::lock_guard<std::mutex> lock(summaryMutx);
             //TODO: fix JSON formatting for the appended reports
-            files_util::write_to_file(report_path, hh_report->toJSON(this->hh_args), true);
+            std::wstringstream summary_str1;
+            hh_report->toJSON(summary_str1, this->hh_args);
+            files_util::write_to_file(report_path, summary_str1.str(), true);
         }
     }
     if (hh_args.log) {

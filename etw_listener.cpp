@@ -1,6 +1,8 @@
 #include "etw_listener.h"
+#ifdef __USE_ETW__
+
 #include "hh_scanner.h"
-#include <winmeta.h>
+
 #include <string>
 #include <thread>
 #include <mutex>
@@ -8,10 +10,9 @@
 #include "util/process_util.h"
 #include "term_util.h"
 
-#if (_MSC_VER >= 1900)
-
 #define EXECUTABLE_FLAGS (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
 #define MAX_PROCESSES 65536
+
 
 // Global var for ETW thread
 
@@ -60,6 +61,7 @@ struct ProceesStat
 };
 
 ProceesStat procStats[MAX_PROCESSES] = { 0 };
+time_t g_initTime = 0;
 
 // ETW Handler
 // To filter our events, we want to compare against the
@@ -159,7 +161,7 @@ bool isAllocationExecutable(std::uint32_t pid, LPVOID baseAddress)
 }
 
 
-inline std::wstring getProcessName(DWORD pid)
+inline std::wstring getProcessName(const DWORD pid)
 {
     WCHAR processName[MAX_PATH] = { 0 };
     if (!process_util::get_process_path(pid, processName, MAX_PATH * 2)) {
@@ -175,55 +177,24 @@ inline std::wstring getProcessName(DWORD pid)
 }
 
 
-bool isWatchedPid(DWORD pid)
+bool isWatchedPid(const DWORD pid)
 {
-    if (!g_hh_args.names_list.size() && !g_hh_args.pids_list.size() 
-        && !g_hh_args.ignored_names_list.size())
-    {
-        // no filter applied, watch everything
-        return true;
-    }
-    if (g_hh_args.pids_list.find(pid) != g_hh_args.pids_list.end()) {
-        // the PID is on the watch list
-        return true;
-    }
-    
     // get process name:
-    std::wstring wImgFileName = getProcessName(pid);
-    if (g_hh_args.names_list.find(wImgFileName) != g_hh_args.names_list.end()) {
-        // the name is on the watch list
+    const std::wstring wImgFileName = getProcessName(pid);
+    const t_single_scan_status res = HHScanner::shouldScanProcess(g_hh_args, g_initTime, pid, wImgFileName.c_str());
+    if (res == SSCAN_READY) {
         return true;
     }
-    if (g_hh_args.ignored_names_list.size() &&
-        g_hh_args.ignored_names_list.find(wImgFileName) == g_hh_args.ignored_names_list.end())
-    {
-        // the name is NOT on the ignore list
-        return true;
-    }
-    // the PID is not on the watch list
     return false;
 }
 
-bool isWatchedName(std::string& imgFileName)
+bool isWatchedName(const std::string& imgFileName)
 {
-    if (!g_hh_args.names_list.size() && !g_hh_args.pids_list.size()
-        && !g_hh_args.ignored_names_list.size())
-    {
-        // no filter applied, watch everything
+    const std::wstring wImgFileName(imgFileName.begin(), imgFileName.end());
+    const t_single_scan_status res = HHScanner::shouldScanProcess(g_hh_args, g_initTime, 0, wImgFileName.c_str());
+    if (res == SSCAN_READY) {
         return true;
     }
-    std::wstring wImgFileName(imgFileName.begin(), imgFileName.end());
-    if (g_hh_args.names_list.find(wImgFileName) != g_hh_args.names_list.end()) {
-        // the name is on the watch list
-        return true;
-    }
-    if (g_hh_args.ignored_names_list.size() &&
-        g_hh_args.ignored_names_list.find(wImgFileName) == g_hh_args.ignored_names_list.end())
-    {
-        // the name is NOT on the ignore list
-        return true;
-    }
-    // the name is not on the watch list
     return false;
 }
 
@@ -234,13 +205,14 @@ void runHHinNewThread(t_hh_params args)
         return;
     }
     long pid = *(args.pids_list.begin());
-    HHScanner hhunter(args);
+    HHScanner hhunter(args, g_initTime);
     HHScanReport* report = hhunter.scan();
     if (report)
     {
-        if (!g_hh_args.quiet || report->countSuspicious()) {
+        // in this mode only suspicious will be reported
+        if (!g_hh_args.quiet || report->countReports(pesieve::SHOW_SUSPICIOUS)) {
             const std::lock_guard<std::mutex> lock(g_stdOutMutex);
-            hhunter.summarizeScan(report);
+            hhunter.summarizeScan(report, pesieve::SHOW_SUSPICIOUS);
         }
         else {
             hhunter.writeToLog(report);
@@ -299,9 +271,23 @@ void printAllProperties(krabs::parser &parser)
     }
 }
 
-bool ETWstart()
+std::string ipv4FromDword(DWORD ip_dword)
+{
+    std::ostringstream oss;
+    BYTE* ip_bytes = (BYTE*)&ip_dword;
+    const size_t chunks = sizeof(DWORD);
+    for (int i = 0; i < chunks; i++) {
+        oss << std::dec << (unsigned int)ip_bytes[i];
+        if (i < (chunks - 1))
+            oss << ".";
+    }
+    return oss.str();
+}
+
+bool ETWstart(ETWProfile& settings)
 {
     krabs::kernel_trace trace(L"HollowsHunter");
+    g_initTime = time(NULL);
 
     krabs::kernel::process_provider         processProvider;
     krabs::kernel::image_load_provider      imageLoadProvider;
@@ -312,13 +298,15 @@ bool ETWstart()
     // Process Start Trigger
     processProvider.add_on_event_callback([](const EVENT_RECORD& record, const krabs::trace_context& trace_context)
         {
+            const int OPCODE_START = 0x1;
+            const int OPCODE_STOP = 0x2;
             krabs::schema schema(record, trace_context.schema_locator);
-            if (schema.event_opcode() == WINEVENT_OPCODE_STOP) {
+            if (schema.event_opcode() == OPCODE_STOP) {
                 krabs::parser parser(schema);
                 std::uint32_t pid = parser.parse<std::uint32_t>(L"ProcessId");
                 procStats[pid].cleanupThread();
             }
-            if (schema.event_opcode() == WINEVENT_OPCODE_START)
+            if (schema.event_opcode() == OPCODE_START)
             {
                 krabs::parser parser(schema);
                 std::uint32_t parentPid = parser.parse<std::uint32_t>(L"ParentId");
@@ -374,9 +362,18 @@ bool ETWstart()
             krabs::parser parser(schema);
             std::uint32_t pid = parser.parse<std::uint32_t>(L"PID");
             if (!isWatchedPid(pid)) return;
+
+            krabs::ip_address daddr = parser.parse<krabs::ip_address>(L"daddr");
+
+
             if (!g_hh_args.quiet) {
                 const std::lock_guard<std::mutex> stdOutLock(g_stdOutMutex);
-                std::wcout << std::dec << pid << " : " << schema.task_name() << " : " << schema.opcode_name() << "\n";
+                std::wcout << std::dec << pid << " : " << schema.task_name() << " : " << schema.opcode_name();
+                if (!daddr.is_ipv6) {
+                    long ipv4 = daddr.v4;
+                    std::cout << " -> " << ipv4FromDword(ipv4);
+                }
+                std::wcout <<"\n";
             }
             runHHScan(pid);
         });
@@ -426,11 +423,11 @@ bool ETWstart()
         });
 
     bool isOk = true;
-    trace.enable(tcpIpProvider);
-    trace.enable(objectMgrProvider);
-    trace.enable(processProvider);
-    trace.enable(imageLoadProvider);
-    trace.enable(virtualAllocProvider);
+    if (settings.tcpip) trace.enable(tcpIpProvider);
+    if (settings.obj_mgr) trace.enable(objectMgrProvider);
+    if (settings.process_start) trace.enable(processProvider);
+    if (settings.img_load) trace.enable(imageLoadProvider);
+    if (settings.allocation) trace.enable(virtualAllocProvider);
     try {
         std::cout << "Starting listener..." << std::endl;
         trace.start();
@@ -442,4 +439,4 @@ bool ETWstart()
     return isOk;
 }
 
-#endif //(_MSC_VER >= 1900)
+#endif // __USE_ETW__

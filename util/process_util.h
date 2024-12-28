@@ -2,15 +2,17 @@
 
 #include <windows.h>
 #include <psapi.h>
-
+#include <iostream>
 #include "suspend.h"
 
 namespace process_util {
 
-
     inline bool is_wow_64(HANDLE process)
     {
-        FARPROC procPtr = GetProcAddress(GetModuleHandleA("kernel32"), "IsWow64Process");
+        HMODULE kernel32 = GetModuleHandleA("kernel32");
+        if (!kernel32) return false; // should not happen
+
+        FARPROC procPtr = GetProcAddress(kernel32, "IsWow64Process");
         if (!procPtr) {
             //this system does not have a function IsWow64Process
             return false;

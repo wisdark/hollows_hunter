@@ -15,44 +15,57 @@ std::cout.fill(' '); \
 if (field_size) stream << std::setw(field_size) << ' '; \
 stream << str;
 
-bool is_suspicious_process(pesieve::t_report report)
-{
-    if (report.suspicious) {
-        return true;
-    }
-    return false;
-}
 
 bool HHScanReport::appendReport(pesieve::t_report &scan_report, const std::wstring &img_name)
 {
     pidToReport[scan_report.pid] = scan_report;
     pidToName[scan_report.pid] = img_name;
-    if (is_suspicious_process(scan_report)) {
+    if (scan_report.suspicious) {
         this->suspicious.push_back(scan_report.pid);
+    }
+    if (scan_report.errors == pesieve::ERROR_SCAN_FAILURE) {
+        this->failed.push_back(scan_report.pid);
     }
     return true;
 }
 
-size_t HHScanReport::reportsToString(std::wstringstream& stream, bool suspiciousOnly)
+size_t HHScanReport::reportsToString(std::wstringstream& stream, const pesieve::t_results_filter rfilter)
 {
+    if (rfilter == pesieve::SHOW_NONE) {
+        return 0;
+    }
     size_t printed = 0;
     size_t counter = 0;
-    size_t scannedCount = pidToReport.size();
-    if (suspiciousOnly) {
-        scannedCount = suspicious.size();
-    }
+    size_t scannedCount = countReports(rfilter);
+
     if (!scannedCount) {
         return printed;
     }
-    const size_t max_len = size_t(std::floor(std::log10(double(scannedCount - 1))) + 1);
+
+    const size_t max_len = size_t(std::floor(std::log10(double(scannedCount))) + 1) % 100;
     for (auto itr = this->pidToReport.begin(); itr != pidToReport.end(); ++itr) {
+        bool isFailed = false;
         DWORD pid = itr->first;
-        if (suspiciousOnly) {
-            pesieve::t_report rep = itr->second;
+        pesieve::t_report rep = itr->second;
+        if ((rfilter & pesieve::SHOW_SUSPICIOUS) == 0) {
+            if (rep.suspicious) continue;
+        }
+        if ((rfilter & pesieve::SHOW_NOT_SUSPICIOUS) == 0) {
             if (!rep.suspicious) continue;
         }
+        if (rep.errors == pesieve::ERROR_SCAN_FAILURE) {
+            isFailed = true;
+        }
+        
+        if (isFailed && ((rfilter & pesieve::SHOW_ERRORS) == 0)) {
+            continue; // do not display failed
+        }
         stream << L"[" << std::setw(max_len) << counter++ << L"]: PID: " << std::dec << pid << L", ";
-        stream << L"Name: " << this->pidToName[pid] << L"\n";
+        stream << L"Name: " << this->pidToName[pid];
+        if (isFailed) {
+            stream << L" : FAILED";
+        }
+        stream << L"\n";
         printed++;
     }
     return printed;
@@ -108,15 +121,14 @@ size_t HHScanReport::reportsToJSON(std::wstringstream &stream, size_t level, con
     return printed;
 }
 
-std::string HHScanReport::toJSON(const t_hh_params &params)
+size_t HHScanReport::toJSON(std::wstringstream &stream, const t_hh_params &params)
 {
-    std::wstringstream stream;
     size_t level = 0;
     OUT_PADDED(stream, level, L"{\n");
     level++;
     //summary:
-    const size_t suspicious_count = countSuspicious();
-
+    const size_t suspicious_count = countReports(pesieve::SHOW_SUSPICIOUS);
+    size_t all_count = 0;
     OUT_PADDED(stream, level, L"\"scan_date_time\" : ");
     stream << std::dec << L"\"" << util::strtime(this->startTime) << L"\"" << L",\n";
     OUT_PADDED(stream, level, L"\"scan_timestamp\" : ");
@@ -124,19 +136,21 @@ std::string HHScanReport::toJSON(const t_hh_params &params)
     OUT_PADDED(stream, level, L"\"scan_time_ms\" : ");
     stream << std::dec << getScanTime() << L",\n";
     OUT_PADDED(stream, level, L"\"scanned_count\" : ");
-    stream << std::dec << countTotal() << L",\n";
+    stream << std::dec << countTotal(true) << L",\n";
+    OUT_PADDED(stream, level, L"\"failed_count\" : ");
+    stream << std::dec << countReports(pesieve::SHOW_ERRORS) << L",\n";
     OUT_PADDED(stream, level, L"\"suspicious_count\" : ");
     stream << std::dec << suspicious_count;
     if (suspicious_count > 0) {
         stream << L",\n";
-        reportsToJSON(stream, level, params);
+        all_count = reportsToJSON(stream, level, params);
     }
     else {
         stream << L"\n";
     }
     level--;
     OUT_PADDED(stream, level, L"}\n");
-    return std::wstring_convert<std::codecvt_utf8<wchar_t>>().to_bytes(stream.str());
+    return all_count;
 }
 
 template<class STR_STREAM>
@@ -153,9 +167,8 @@ void print_scantime(STR_STREAM& stream, size_t timeInMs)
     }
 }
 
-std::string HHScanReport::toString(bool suspiciousOnly)
+void HHScanReport::toString(std::wstringstream &stream, const pesieve::t_results_filter rfilter)
 {
-    std::wstringstream stream;
     //summary:
     stream << L"--------" << std::endl;
     stream << L"SUMMARY:\n";
@@ -163,15 +176,22 @@ std::string HHScanReport::toString(bool suspiciousOnly)
     stream << L"Finished scan in: ";
     print_scantime(stream, getScanTime());
     stream << L"\n";
-    stream << L"[*] Total scanned: " << std::dec << countTotal() << L"\n";
-    if (!suspiciousOnly && countTotal() > 0) {
+    const size_t scannedCount = countReports(pesieve::SHOW_SUCCESSFUL_ONLY);
+    stream << L"[*] Total scanned: " << std::dec << scannedCount << L"\n";
+    if ((rfilter & pesieve::SHOW_NOT_SUSPICIOUS) && scannedCount > 0) {
         stream << L"[+] List of scanned: \n";
-        reportsToString(stream, false);
+        reportsToString(stream, pesieve::SHOW_SUCCESSFUL_ONLY);
     }
-    stream << L"[*] Total suspicious: " << std::dec << countSuspicious() << L"\n";
-    if (countSuspicious() > 0) {
-        stream << L"[+] List of suspicious: \n";
-        reportsToString(stream, true);
+    if (rfilter & pesieve::SHOW_SUSPICIOUS) {
+        const size_t count = countReports(pesieve::SHOW_SUSPICIOUS);
+        stream << L"[*] Total suspicious: " << std::dec << count << L"\n";
+        if (count > 0) {
+            stream << L"[+] List of suspicious: \n";
+            reportsToString(stream, pesieve::SHOW_SUSPICIOUS);
+        }
     }
-    return std::wstring_convert<std::codecvt_utf8<wchar_t>>().to_bytes(stream.str());
+    if (rfilter & pesieve::SHOW_ERRORS) {
+        const size_t count = countReports(pesieve::SHOW_ERRORS);
+        stream << L"[*] Total failed: " << std::dec << count << L"\n";
+    }
 }
